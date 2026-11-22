@@ -7,6 +7,7 @@ const HEADERS = {
 };
 
 const PUMP_PROGRAM = new PublicKey("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
+const METADATA_PROGRAM = new PublicKey("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s");
 const connection = new Connection(
   process.env.SOLANA_RPC_URL || "https://api.mainnet-beta.solana.com",
   "confirmed"
@@ -16,7 +17,10 @@ const connection = new Connection(
 const cache = new Map();
 const TTL = 30_000;
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// --- skip a rate-limited source for 60s ---
+const blockedUntil = new Map();
+const COOLDOWN = 60_000;
+const isBlocked = (name) => (blockedUntil.get(name) || 0) > Date.now();
 
 const logError = (label, e) => {
   console.log(`[${label}] FAILED`, {
@@ -27,16 +31,46 @@ const logError = (label, e) => {
   });
 };
 
-const getWithRetry = async (url, opts = {}, retries = 1) => {
+const apiGet = async (name, url) => {
   try {
-    return await axios.get(url, { timeout: 8000, headers: HEADERS, ...opts });
+    return await axios.get(url, { timeout: 8000, headers: HEADERS });
   } catch (e) {
-    if (e.response?.status === 429 && retries > 0) {
-      console.log(`[retry] 429 on ${url.split("/")[2]}, waiting 2s`);
-      await sleep(2000);
-      return getWithRetry(url, opts, retries - 1);
+    if (e.response?.status === 429) {
+      blockedUntil.set(name, Date.now() + COOLDOWN);
+      console.log(`[${name}] 429, skipping this source for 60s`);
     }
     throw e;
+  }
+};
+
+// Reads the token symbol from the Metaplex metadata account (works on any RPC)
+const getSymbol = async (mintKey) => {
+  try {
+    const [metaPda] = PublicKey.findProgramAddressSync(
+      [Buffer.from("metadata"), METADATA_PROGRAM.toBuffer(), mintKey.toBuffer()],
+      METADATA_PROGRAM
+    );
+    const info = await connection.getAccountInfo(metaPda);
+    if (!info || info.data.length < 115) return "N/A";
+    const d = info.data;
+    // key(1) + updateAuthority(32) + mint(32) + name(4 + 32) + symbol(4 + 10)
+    const len = Math.min(d.readUInt32LE(101), 10);
+    const symbol = d.slice(105, 105 + len).toString("utf8").replace(/\0/g, "").trim();
+    return symbol || "N/A";
+  } catch (e) {
+    logError("symbol", e);
+    return "N/A";
+  }
+};
+
+const getSolUsd = async () => {
+  try {
+    const r = await axios.get("https://api.coinbase.com/v2/prices/SOL-USD/spot", { timeout: 5000 });
+    const p = Number(r.data?.data?.amount);
+    return p > 0 ? p : null;
+  } catch (e) {
+    logError("SOL price", e);
+    return null;
   }
 };
 
@@ -61,46 +95,55 @@ export const GetContractDetails = async (ctx, ca) => {
   };
 
   // --- 1. GECKOTERMINAL ---
-  try {
-    const res = await getWithRetry(
-      `https://api.geckoterminal.com/api/v2/networks/solana/tokens/${mint}`
-    );
-    const a = res.data?.data?.attributes;
-    console.log(`[GeckoTerminal] status ${res.status}, symbol: ${a?.symbol}, price: ${a?.price_usd}`);
-    if (a?.symbol && a?.price_usd) {
-      return done({
-        source: "GeckoTerminal",
-        symbol: a.symbol,
-        chain: "solana",
-        dex: "Aggregated",
-        price: `$${a.price_usd}`,
-        liquidity: a.total_reserve_in_usd
-          ? `$${Number(a.total_reserve_in_usd).toLocaleString()}`
-          : "N/A",
-      });
+  if (!isBlocked("GeckoTerminal")) {
+    try {
+      const res = await apiGet(
+        "GeckoTerminal",
+        `https://api.geckoterminal.com/api/v2/networks/solana/tokens/${mint}`
+      );
+      const a = res.data?.data?.attributes;
+      console.log(`[GeckoTerminal] status ${res.status}, symbol: ${a?.symbol}, price: ${a?.price_usd}`);
+      if (a?.symbol && a?.price_usd) {
+        return done({
+          source: "GeckoTerminal",
+          symbol: a.symbol,
+          chain: "solana",
+          dex: "Aggregated",
+          price: `$${a.price_usd}`,
+          liquidity: a.total_reserve_in_usd
+            ? `$${Number(a.total_reserve_in_usd).toLocaleString()}`
+            : "N/A",
+        });
+      }
+    } catch (e) {
+      logError("GeckoTerminal", e);
     }
-  } catch (e) {
-    logError("GeckoTerminal", e);
+  } else {
+    console.log("[GeckoTerminal] skipped (cooldown)");
   }
 
   // --- 2. DEXSCREENER ---
-  try {
-    const res = await getWithRetry(`https://api.dexscreener.com/latest/dex/tokens/${mint}`);
-    const pairs = res.data?.pairs;
-    console.log(`[DexScreener] status ${res.status}, pairs: ${Array.isArray(pairs) ? pairs.length : pairs}`);
-    if (Array.isArray(pairs) && pairs.length > 0) {
-      const best = [...pairs].sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0))[0];
-      return done({
-        source: "DexScreener",
-        price: best.priceUsd ? `$${best.priceUsd}` : "N/A",
-        liquidity: best.liquidity?.usd ? `$${best.liquidity.usd.toLocaleString()}` : "N/A",
-        dex: best.dexId || "N/A",
-        chain: best.chainId || "N/A",
-        symbol: best.baseToken?.symbol || "N/A",
-      });
+  if (!isBlocked("DexScreener")) {
+    try {
+      const res = await apiGet("DexScreener", `https://api.dexscreener.com/latest/dex/tokens/${mint}`);
+      const pairs = res.data?.pairs;
+      console.log(`[DexScreener] status ${res.status}, pairs: ${Array.isArray(pairs) ? pairs.length : pairs}`);
+      if (Array.isArray(pairs) && pairs.length > 0) {
+        const best = [...pairs].sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0))[0];
+        return done({
+          source: "DexScreener",
+          price: best.priceUsd ? `$${best.priceUsd}` : "N/A",
+          liquidity: best.liquidity?.usd ? `$${best.liquidity.usd.toLocaleString()}` : "N/A",
+          dex: best.dexId || "N/A",
+          chain: best.chainId || "N/A",
+          symbol: best.baseToken?.symbol || "N/A",
+        });
+      }
+    } catch (e) {
+      logError("DexScreener", e);
     }
-  } catch (e) {
-    logError("DexScreener", e);
+  } else {
+    console.log("[DexScreener] skipped (cooldown)");
   }
 
   // --- 3. ON-CHAIN PUMP.FUN BONDING CURVE ---
@@ -119,13 +162,21 @@ export const GetContractDetails = async (ctx, ca) => {
       const vSol = Number(d.readBigUInt64LE(16));
       const complete = d[48] === 1;
       const priceSol = vSol && vTok ? (vSol / 1e9) / (vTok / 1e6) : 0;
+
+      // symbol + SOL/USD in parallel
+      const [symbol, solUsd] = await Promise.all([getSymbol(mintKey), getSolUsd()]);
+      console.log(`[on-chain] symbol: ${symbol}, solUsd: ${solUsd}`);
+
+      const priceUsdText = solUsd ? ` (~$${(priceSol * solUsd).toFixed(10)})` : "";
+      const liqSol = (vSol / 1e9).toFixed(2);
+
       return done({
         source: "pump.fun (on-chain)",
-        symbol: "N/A", // not stored in the curve account
+        symbol,
         chain: "solana",
         dex: complete ? "Migrated (PumpSwap/Raydium)" : "pump.fun",
-        price: `${priceSol.toFixed(9)} SOL`,
-        liquidity: `${(vSol / 1e9).toFixed(2)} SOL`,
+        price: `${priceSol.toFixed(9)} SOL${priceUsdText}`,
+        liquidity: complete ? `${liqSol} SOL (stale, token migrated)` : `${liqSol} SOL (virtual)`,
       });
     }
   } catch (e) {
